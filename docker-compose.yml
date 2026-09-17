@@ -1,0 +1,177 @@
+# Demo stack: real-time service behind a TLS edge, with metrics, dashboards and
+# a load generator.
+#
+# Ports are 8080/8443 rather than 80/443 so the whole stack runs rootless
+# without privileged port binding. On a real host the edge binds 80/443 and
+# everything else stays on the private network.
+
+name: realtime-edge-demo
+
+x-logging: &default-logging
+  # Without this, container logs grow until they fill the disk. "The disk
+  # filled up with logs" is a genuinely common outage and a trivially
+  # preventable one.
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  echo-service:
+    build:
+      context: .
+      target: echo-service
+      args:
+        VERSION: ${VERSION:-dev}
+    # Single variable so a deploy pins a digest by rewriting one line in .env;
+    # see scripts/deploy.sh.
+    image: ${ECHO_IMAGE:-realtime-edge-demo/echo-service:local}
+    restart: unless-stopped
+    environment:
+      LISTEN_ADDR: ":8080"
+      MAX_SESSIONS: "${MAX_SESSIONS:-5000}"
+      IDLE_TIMEOUT: "75s"
+      SHUTDOWN_GRACE: "15s"
+      # Demo-only knobs: they give the dashboards a latency distribution and a
+      # non-zero error rate to display. Both default to off in the binary.
+      PROCESSING_JITTER: "${PROCESSING_JITTER:-25ms}"
+      ERROR_INJECTION_RATE: "${ERROR_INJECTION_RATE:-0.02}"
+    # No ports published. The service is reachable only through the edge and
+    # by the scraper, both on internal networks.
+    networks: [edge, monitoring]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    logging: *default-logging
+    # Give the service time to close sessions cleanly before SIGKILL. The
+    # default 10s can cut a drain short mid-deploy.
+    stop_grace_period: 30s
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      echo-service:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+      - "${HTTPS_PORT:-8443}:8443"
+    volumes:
+      # Mounted as a template: the entrypoint substitutes the resolver
+      # address and writes the result into conf.d at start-up.
+      - ./nginx/templates/edge.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./nginx/docker-entrypoint.d/15-detect-resolver.envsh:/docker-entrypoint.d/15-detect-resolver.envsh:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    networks: [edge, monitoring]
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8090/stub_status"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.4.2
+    restart: unless-stopped
+    depends_on:
+      nginx:
+        condition: service_healthy
+    command:
+      - --nginx.scrape-uri=http://nginx:8090/stub_status
+    networks: [monitoring]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    logging: *default-logging
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    # Bound to loopback, not published to the network. Prometheus has no
+    # authentication of its own, so anything that reaches it can read every
+    # metric and, with the lifecycle API enabled, reload its configuration.
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    networks: [monitoring]
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      # Served under /grafana through the edge, so there is one TLS entry
+      # point rather than a second published port to secure separately.
+      GF_SERVER_ROOT_URL: "https://localhost:${HTTPS_PORT:-8443}/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # No phoning home from a server that is meant to sit in a private network.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks: [edge, monitoring]
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  # Held behind a profile so `docker compose up` does not start generating
+  # load on its own. `make load` and `make demo` bring it in explicitly.
+  loadgen:
+    build:
+      context: .
+      target: loadgen
+    image: ${LOADGEN_IMAGE:-realtime-edge-demo/loadgen:local}
+    profiles: [load]
+    depends_on:
+      nginx:
+        condition: service_healthy
+    command:
+      - -url=wss://nginx:8443/ws
+      - -connections=${LOAD_CONNECTIONS:-25}
+      - -rate=${LOAD_RATE:-5}
+      - -duration=${LOAD_DURATION:-0s}
+    networks: [edge]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    logging: *default-logging
+
+networks:
+  # Traffic that the edge can reach.
+  edge:
+    driver: bridge
+  # Scrape traffic. Prometheus sits only here, so nothing reachable from the
+  # edge can route to it even if the proxy is misconfigured.
+  monitoring:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:

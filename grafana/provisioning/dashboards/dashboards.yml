@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+  - name: realtime-edge
+    orgId: 1
+    folder: "Realtime Edge"
+    type: file
+    disableDeletion: true
+    # Dashboards are owned by the repository. Edits made in the UI are for
+    # exploration; anything worth keeping is exported back into git.
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

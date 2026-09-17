@@ -1,0 +1,28 @@
+#!/bin/sh
+# Discovers the DNS server this container should use and exports it for the
+# template substitution step that runs next.
+#
+# The .envsh extension matters: the nginx image's entrypoint *sources* those,
+# so an export here survives into the envsubst script. A plain .sh would run
+# in a subshell and the variable would be lost.
+#
+# Needed because nginx caches upstream DNS resolution at config-load time
+# unless an explicit resolver is configured, and the resolver's address differs
+# between container runtimes. See the comment block in the template.
+
+set -eu
+
+# First IPv4 nameserver wins. IPv6 entries are skipped because the config sets
+# ipv6=off, and passing an IPv6 address to a resolver that will not query over
+# it produces a confusing startup failure rather than a clear one.
+DNS_RESOLVER="$(awk '/^nameserver/ && $2 ~ /^[0-9]+\./ { print $2; exit }' /etc/resolv.conf 2>/dev/null || true)"
+
+if [ -z "${DNS_RESOLVER}" ]; then
+    # Docker's embedded DNS, as the least surprising fallback.
+    DNS_RESOLVER="127.0.0.11"
+    echo "15-detect-resolver: no IPv4 nameserver in /etc/resolv.conf, defaulting to ${DNS_RESOLVER}"
+else
+    echo "15-detect-resolver: using DNS resolver ${DNS_RESOLVER}"
+fi
+
+export DNS_RESOLVER

@@ -1,0 +1,12 @@
+.git
+.github
+docs
+terraform
+grafana
+prometheus
+nginx
+scripts
+demo-output
+*.md
+Makefile
+docker-compose.yml

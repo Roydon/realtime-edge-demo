@@ -1,0 +1,180 @@
+name: Release
+
+# Tag-driven. A release is an explicit, named act: pushing to main builds and
+# tests but ships nothing. `git tag v1.2.3 && git push --tags` is the only way
+# an image reaches the registry, which means the registry always maps to a
+# commit someone deliberately marked.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run the deploy as a dry run (no changes on the target host)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/echo-service
+
+jobs:
+  # A release must not be able to ship something that would fail CI. Rerunning
+  # the gate here rather than trusting a prior green run also covers the case
+  # of a tag pointing at a commit that never ran CI at all.
+  gate:
+    name: Test gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  build:
+    name: Build and push image
+    runs-on: ubuntu-24.04
+    needs: gate
+    permissions:
+      contents: read
+      packages: write
+      # Required to publish a build provenance attestation.
+      id-token: write
+      attestations: write
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # The built-in token is scoped to this repository and expires with
+          # the job. No long-lived registry credential is stored anywhere.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=echo-service
+            org.opencontainers.image.description=Real-time stand-in service for the edge demo stack
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: echo-service
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # amd64 for the droplet, arm64 because ARM instances are materially
+          # cheaper for this workload and worth being able to move to.
+          platforms: linux/amd64,linux/arm64
+
+      # Signed provenance linking the image digest back to this workflow run,
+      # so "where did this image come from?" has an answer that does not rely
+      # on a tag nobody can prove was not moved.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  deploy:
+    name: Deploy over SSH
+    runs-on: ubuntu-24.04
+    needs: build
+    # The environment is where a required reviewer is attached, so production
+    # deploys pause for a human even though the tag push was automatic.
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide dry-run mode
+        id: mode
+        run: |
+          # Dry run unless the repository explicitly opts in by setting the
+          # DEPLOY_ENABLED variable. This repository is a demonstration, so the
+          # default path prints exactly what would happen and changes nothing.
+          if [ "${{ vars.DEPLOY_ENABLED }}" = "true" ] && [ "${{ inputs.dry_run }}" != "true" ]; then
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure SSH
+        if: steps.mode.outputs.dry_run == 'false'
+        run: |
+          install -m 700 -d ~/.ssh
+          # The key is written to disk because ssh requires a file; the runner
+          # is ephemeral and the file dies with it.
+          printf '%s' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # A pinned host key, not StrictHostKeyChecking=no. Disabling host
+          # verification in CI accepts whatever answers on that address, which
+          # turns every deploy into an opportunity for a man in the middle.
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          VERSION: ${{ github.ref_name }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+        run: ./scripts/deploy.sh
+
+      - name: Post-deploy health check
+        if: steps.mode.outputs.dry_run == 'false'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          # A deploy is not finished when the container starts; it is finished
+          # when the service answers. Failing here is what makes the rollback
+          # step below reachable.
+          for i in $(seq 1 30); do
+            if curl -sf --max-time 5 "https://${DEPLOY_HOST}/healthz" >/dev/null; then
+              echo "service healthy after ${i} attempts"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::service did not become healthy within 150s"
+          exit 1
+
+      - name: Roll back on failed health check
+        if: failure() && steps.mode.outputs.dry_run == 'false'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          echo "::warning::deploy failed its health check, rolling back to the previous image"
+          ssh -o BatchMode=yes "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            'cd /opt/realtime-edge && ./rollback.sh'

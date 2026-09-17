@@ -1,0 +1,51 @@
+# Recording rules pre-compute the percentile expressions the dashboards use.
+#
+# Two reasons, both operational: a dashboard panel that evaluates a
+# histogram_quantile over a wide range on every refresh is a common cause of
+# slow Grafana, and pinning the expression here means the dashboard and the
+# alert on the same signal can never drift apart.
+groups:
+  - name: echo-service-latency
+    interval: 10s
+    rules:
+      - record: job:echo_latency_seconds:p50
+        expr: |
+          histogram_quantile(
+            0.50,
+            sum by (le, transport) (rate(voice_echo_message_latency_seconds_bucket[1m]))
+          )
+
+      - record: job:echo_latency_seconds:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, transport) (rate(voice_echo_message_latency_seconds_bucket[1m]))
+          )
+
+      - record: job:echo_latency_seconds:p99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, transport) (rate(voice_echo_message_latency_seconds_bucket[1m]))
+          )
+
+  - name: echo-service-errors
+    interval: 10s
+    rules:
+      # Errors as a fraction of inbound messages. A raw error count says
+      # nothing without traffic volume next to it: 50 errors/s is a crisis at
+      # 100 msg/s and background noise at 100k msg/s.
+      #
+      # `or vector(0)` keeps the series defined when no errors have occurred,
+      # so the panel reads 0 rather than going blank and the alert's `for`
+      # clause is not reset by a gap in the series.
+      - record: job:echo_error_ratio:rate1m
+        expr: |
+          (
+            sum(rate(voice_echo_errors_total[1m]))
+            /
+            clamp_min(sum(rate(voice_echo_messages_total{direction="in"}[1m])), 0.001)
+          ) or vector(0)
+
+      - record: job:echo_message_rate:rate1m
+        expr: sum by (transport, direction) (rate(voice_echo_messages_total[1m]))

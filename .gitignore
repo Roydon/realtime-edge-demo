@@ -1,0 +1,30 @@
+# Certificates and keys are generated locally by `make certs`, never committed.
+nginx/certs/
+
+# Local configuration and secrets.
+.env
+
+# Local build notes and tooling state. Not part of the published repository.
+CLAUDE.md
+.claude/
+
+# Volume snapshots produced by `make backup`.
+backups/
+
+# Build output.
+/bin/
+/dist/
+demo-output/
+
+# Terraform: state can contain secrets in plaintext, and the provider plugin
+# directory is large and machine-specific.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform.lock.hcl
+crash.log
+
+# OS and editor noise.
+.DS_Store
+*.swp

@@ -1,0 +1,38 @@
+# Pinned linter configuration so CI and a developer's machine make the same
+# judgements. An unpinned golangci-lint changes its default linter set between
+# releases, which turns "CI is red and it was green yesterday" into a regular
+# event unconnected to any code change.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck      # an ignored error is the most common source of silent failure
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose     # an unclosed response body leaks a connection per request
+    - errorlint     # wrapped errors compared with == rather than errors.Is
+    - gosec
+    - misspell
+    - unconvert
+    - wastedassign
+
+  settings:
+    gosec:
+      excludes:
+        # The load generator skips TLS verification by design: it is a test
+        # harness pointed at a known local endpoint presenting the self-signed
+        # demo certificate. Annotated at the call site.
+        - G402
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -1,0 +1,45 @@
+# Prometheus configuration for the demo stack.
+#
+# Scrape intervals here are deliberately short so the dashboards react within
+# seconds of `make demo` starting. Production values would be 15-30s: a 5s
+# interval across a real fleet multiplies storage and cardinality for
+# resolution nobody reads.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 5s
+  external_labels:
+    environment: demo
+    stack: realtime-edge
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # The service under observation. It is scraped on the internal network
+  # directly, never through the TLS edge: scraping should not depend on the
+  # component most likely to be the thing that broke.
+  - job_name: echo-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["echo-service:8080"]
+        labels:
+          service: echo-service
+          tier: application
+
+  # Edge metrics. Connection counts here versus session counts in the app are
+  # what distinguish "the proxy is refusing connections" from "the app is
+  # dropping sessions" during an incident.
+  - job_name: nginx
+    static_configs:
+      - targets: ["nginx-exporter:9113"]
+        labels:
+          service: nginx
+          tier: edge
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          service: prometheus
+          tier: observability

@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege by default. Any job needing more asks for it explicitly, so
+# a compromised action in one job cannot write to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  # A superseded run on the same branch is wasted compute and a misleading
+  # status check.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.24"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62
+          args: --timeout=5m
+
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The race detector is not optional for this service: it is built around
+      # concurrent sessions sharing a session map and a metric set, which is
+      # precisely the code a race would hide in.
+      - name: go test -race
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1 >> "$GITHUB_STEP_SUMMARY"
+
+  config-lint:
+    name: Config lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+      # Catches a malformed rule file before it reaches a cluster, where the
+      # failure mode is silent: Prometheus logs the error and carries on with
+      # the previous rules, so alerts stop updating without anything visibly
+      # breaking.
+      - name: Promtool check
+        run: |
+          docker run --rm -v "$PWD/prometheus:/p" --entrypoint promtool \
+            prom/prometheus:v3.1.0 check config /p/prometheus.yml
+          docker run --rm -v "$PWD/prometheus:/p" --entrypoint promtool \
+            prom/prometheus:v3.1.0 check rules /p/rules/recording.yml /p/rules/alerts.yml
+
+      - name: nginx config syntax
+        run: |
+          # The container needs a certificate present for `nginx -t` to parse
+          # the ssl_certificate directives; a throwaway one is sufficient.
+          mkdir -p nginx/certs
+          openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
+            -keyout nginx/certs/edge.key -out nginx/certs/edge.crt \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null
+          docker run --rm \
+            -v "$PWD/nginx/conf.d/edge.conf:/etc/nginx/conf.d/default.conf:ro" \
+            -v "$PWD/nginx/certs:/etc/nginx/certs:ro" \
+            nginx:1.27-alpine nginx -t
+
+      - name: Validate dashboards are parseable JSON
+        run: |
+          for f in grafana/dashboards/*.json; do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
+            echo "ok: $f"
+          done
+
+      - name: docker compose config
+        run: docker compose config -q
+
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.3"
+
+      - name: terraform fmt
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      # -backend=false keeps this from needing state or credentials. The
+      # configuration is plan-only in this repository by design, so validate is
+      # the correct depth for CI.
+      - name: terraform init
+        run: terraform -chdir=terraform init -backend=false
+
+      - name: terraform validate
+        run: terraform -chdir=terraform validate
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start the stack
+        run: |
+          ./scripts/gen-certs.sh
+          docker compose up -d --build
+
+      - name: Wait for the edge
+        run: ./scripts/wait-ready.sh
+
+      - name: Generate traffic
+        run: |
+          # The observability checks assert that metrics exist, so the stack
+          # needs to have served something first.
+          docker compose --profile load run --rm loadgen \
+            -url=wss://nginx:8443/ws -connections=10 -rate=10 -duration=30s -ramp=2s
+
+      - name: Verify end to end
+        run: ./scripts/verify.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail=100
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile load down -v

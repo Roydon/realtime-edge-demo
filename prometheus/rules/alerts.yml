@@ -1,0 +1,94 @@
+# Alert rules.
+#
+# Every rule here is intended to be actionable: it names a symptom a user would
+# feel, and the runbook annotation points at the procedure. Alerts that fire on
+# causes rather than symptoms - CPU is high, a pod restarted - are what train
+# an on-call rotation to ignore the pager.
+groups:
+  - name: availability
+    rules:
+      - alert: EchoServiceDown
+        expr: up{job="echo-service"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Echo service is not being scraped"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} for 30s.
+            Either the service is down or the internal network is broken; both
+            mean new sessions are failing.
+          runbook: "docs/RUNBOOK.md#service-down"
+
+      - alert: EdgeProxyDown
+        expr: up{job="nginx"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Edge proxy metrics unavailable"
+          description: >-
+            The nginx exporter has been unreachable for 30s. If the proxy
+            itself is down, every external client is failing TLS.
+          runbook: "docs/RUNBOOK.md#edge-down"
+
+  - name: latency
+    rules:
+      # 250ms of server-side handling is already past the point where
+      # interactive audio feels wrong, so this is a user-visible symptom
+      # rather than a resource threshold.
+      - alert: EchoLatencyP99High
+        expr: job:echo_latency_seconds:p99{transport="websocket"} > 0.25
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WebSocket p99 handling latency above 250ms"
+          description: >-
+            p99 is {{ $value | humanizeDuration }} over the last minute. The
+            two-minute `for` clause keeps a brief load spike from paging
+            anyone; a sustained breach is a real degradation.
+          runbook: "docs/RUNBOOK.md#high-latency"
+
+      - alert: EchoLatencyP99Critical
+        expr: job:echo_latency_seconds:p99{transport="websocket"} > 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "WebSocket p99 handling latency above 1s"
+          description: >-
+            p99 is {{ $value | humanizeDuration }}. At this level sessions are
+            effectively unusable, not merely degraded.
+          runbook: "docs/RUNBOOK.md#high-latency"
+
+  - name: errors
+    rules:
+      - alert: EchoErrorRateHigh
+        expr: job:echo_error_ratio:rate1m > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Error ratio above 5% of inbound messages"
+          description: >-
+            {{ $value | humanizePercentage }} of inbound messages are erroring.
+            Check the error-cause breakdown to tell an injected or upstream
+            fault apart from client-side disconnects.
+          runbook: "docs/RUNBOOK.md#high-error-rate"
+
+  - name: capacity
+    rules:
+      # Load shedding is working as designed, but it means real users are being
+      # turned away, so it must still reach a human.
+      - alert: EchoSessionsRejected
+        expr: rate(voice_echo_errors_total{cause="overloaded"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sessions are being rejected at the capacity ceiling"
+          description: >-
+            The service is shedding new sessions. Capacity needs to go up or
+            traffic needs to be spread; the ceiling itself is doing its job.
+          runbook: "docs/RUNBOOK.md#capacity"

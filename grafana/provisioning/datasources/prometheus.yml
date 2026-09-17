@@ -1,0 +1,17 @@
+# Datasources are provisioned from this file rather than clicked in through the
+# UI. A dashboard that only exists in someone's browser session is not
+# infrastructure; this way the whole observability stack is reproducible from
+# the repository and survives losing the Grafana volume entirely.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s
+      httpMethod: POST
