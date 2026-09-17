@@ -45,10 +45,13 @@ jobs:
         run: go vet ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.62
-          args: --timeout=5m
+          # v2.x is required: golangci-lint v1 is built against go1.23 and
+          # refuses to lint a module targeting a newer Go version. The v2
+          # config schema in .golangci.yml matches this line, so the two move
+          # together.
+          version: v2.13.2
 
   test:
     name: Test

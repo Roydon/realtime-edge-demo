@@ -132,7 +132,7 @@ func oneSession(ctx context.Context, opt options, st *stats, id int) error {
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 
 	st.connected.Add(1)
 	defer st.connected.Add(-1)

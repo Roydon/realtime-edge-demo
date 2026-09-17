@@ -2,18 +2,17 @@
 # judgements. An unpinned golangci-lint changes its default linter set between
 # releases, which turns "CI is red and it was green yesterday" into a regular
 # event unconnected to any code change.
+#
+# The schema version and the version pinned in .github/workflows/ci.yml move
+# together: a v1 binary cannot read this file.
 version: "2"
 
 run:
   timeout: 5m
 
 linters:
+  default: standard
   enable:
-    - errcheck      # an ignored error is the most common source of silent failure
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
     - bodyclose     # an unclosed response body leaks a connection per request
     - errorlint     # wrapped errors compared with == rather than errors.Is
     - gosec
@@ -22,17 +21,47 @@ linters:
     - wastedassign
 
   settings:
+    errcheck:
+      # A deferred Close on a read-only body or an already-failed connection
+      # has no error worth acting on, and wrapping every one of them in a
+      # closure to discard the result adds noise without adding safety.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*github.com/coder/websocket.Conn).Close
+        - (*github.com/coder/websocket.Conn).CloseNow
+
     gosec:
       excludes:
-        # The load generator skips TLS verification by design: it is a test
-        # harness pointed at a known local endpoint presenting the self-signed
-        # demo certificate. Annotated at the call site.
+        # G404: weak random number generator. Every use of math/rand in this
+        # codebase is jitter, reconnect backoff, or reservoir sampling. None
+        # of them are security decisions, and crypto/rand would be slower for
+        # no benefit.
+        - G404
+        # G402: InsecureSkipVerify. Used only by the load generator, which is
+        # a test harness pointed at a known local endpoint presenting the
+        # demo's self-signed certificate. Annotated at the call site.
         - G402
 
-formatters:
-  enable:
-    - gofmt
+  exclusions:
+    generated: lax
+    rules:
+      # bodyclose cannot see that a WebSocket dial hands its response body to
+      # the connection, which the deferred Close then owns. Every reported
+      # case in this repository is a dial whose connection is closed, and the
+      # only non-test dial is the load generator's.
+      - linters: [bodyclose]
+        path: loadgen/main\.go$
+
+      # Test code builds URLs from httptest servers and deliberately drives
+      # error paths. Holding it to the same taint analysis as production code
+      # produces only false positives.
+      - path: _test\.go$
+        linters: [gosec, bodyclose]
 
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt

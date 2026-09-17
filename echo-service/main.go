@@ -113,11 +113,13 @@ func healthcheck() int {
 	}
 
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("http://" + addr + "/healthz")
+	// The address is built from this process's own configuration, not from
+	// any request input, so there is no untrusted component to the URL.
+	resp, err := client.Get("http://" + addr + "/healthz") //nolint:gosec // self-probe against our own listener
 	if err != nil {
 		return 1
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return 1
 	}
